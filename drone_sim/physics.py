@@ -131,12 +131,14 @@ class QuadrotorPhysics:
         self.drag_gain[env_ids] = uniform(self.p.drag_range)
 
     def reset(self, env_ids: torch.Tensor, pos: torch.Tensor,
-              vel: torch.Tensor | None = None, tilt_std: float = 0.0):
-        """Reset selected envs to given positions with small random attitude."""
+              vel: torch.Tensor | None = None, tilt_std: float = 0.0,
+              omega: torch.Tensor | None = None):
+        """Reset selected envs. tilt_std sets random attitude spread (radians);
+        omega sets initial body-frame angular velocity (for 'thrown' starts)."""
         m = env_ids.shape[0]
         self.pos[env_ids] = pos
         self.vel[env_ids] = vel if vel is not None else torch.zeros(m, 3, device=self.device)
-        self.omega[env_ids] = 0.0
+        self.omega[env_ids] = omega if omega is not None else torch.zeros(m, 3, device=self.device)
 
         q = torch.zeros(m, 4, device=self.device)
         q[:, 0] = 1.0

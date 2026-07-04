@@ -3,6 +3,8 @@
 Tasks:
   hover     — reach and hold a fixed target point
   waypoint  — fly through a sequence of randomly placed waypoints
+  recovery  — thrown in tumbling/inverted with high spin; must right itself
+              and stabilize into a hover. Aggressive, nonlinear flight regime.
 
 Observation (22 dims):
   target - pos (3, clipped), vel (3), body->world rotation matrix (9),
@@ -30,7 +32,7 @@ class QuadrotorEnv:
         waypoint_radius: float = 0.35,
         seed: int | None = None,
     ):
-        assert task in ("hover", "waypoint")
+        assert task in ("hover", "waypoint", "recovery")
         if seed is not None:
             torch.manual_seed(seed)
         self.n = num_envs
@@ -40,6 +42,14 @@ class QuadrotorEnv:
         self.max_steps = int(episode_seconds / self.sim.p.control_dt)
         self.arena = arena_half_extent
         self.wp_radius = waypoint_radius
+
+        # Recovery-task difficulty. `recovery_difficulty` in [0, 1] is a
+        # curriculum knob: 0 = mild tumble, 1 = violently thrown, fully random
+        # orientation. set_difficulty() ramps it during training.
+        self.recovery_difficulty = 1.0
+        self.recovery_max_tilt = 3.1       # radians of attitude spread at diff=1
+        self.recovery_max_spin = 12.0      # rad/s of initial spin at diff=1
+        self.upright_streak = torch.zeros(num_envs, device=self.device)
 
         n, dev = num_envs, self.device
         self.target = torch.zeros(n, 3, device=dev)
@@ -71,6 +81,10 @@ class QuadrotorEnv:
         else:
             self.manual_queue.append(pt)
 
+    def set_difficulty(self, d: float):
+        """Set recovery curriculum difficulty in [0, 1] (0=easy, 1=hardest)."""
+        self.recovery_difficulty = float(max(0.0, min(1.0, d)))
+
     def _sample_targets(self, m: int) -> torch.Tensor:
         t = torch.empty(m, 3, device=self.device)
         t[:, :2] = (torch.rand(m, 2, device=self.device) * 2 - 1) * (self.arena * 0.5)
@@ -82,18 +96,41 @@ class QuadrotorEnv:
             env_ids = torch.arange(self.n, device=self.device)
         m = env_ids.shape[0]
         if m > 0:
-            # Spawn near, not at, the target so the policy sees approach dynamics.
-            start = self._sample_targets(m)
-            offset = torch.randn(m, 3, device=self.device) * 0.8
-            offset[:, 2] = offset[:, 2].clamp(min=-start[:, 2] + 0.3)
-            vel0 = torch.randn(m, 3, device=self.device) * 0.3
-            self.sim.reset(env_ids, start + offset, vel=vel0, tilt_std=0.15)
-            self.target[env_ids] = start
+            if self.task == "recovery":
+                self._reset_recovery(env_ids, m)
+            else:
+                # Spawn near, not at, the target so the policy sees approach.
+                start = self._sample_targets(m)
+                offset = torch.randn(m, 3, device=self.device) * 0.8
+                offset[:, 2] = offset[:, 2].clamp(min=-start[:, 2] + 0.3)
+                vel0 = torch.randn(m, 3, device=self.device) * 0.3
+                self.sim.reset(env_ids, start + offset, vel=vel0, tilt_std=0.15)
+                self.target[env_ids] = start
             self.step_count[env_ids] = 0
             self.prev_action[env_ids] = 0.0
             self.waypoints_hit[env_ids] = 0
-            self.prev_dist[env_ids] = (start - self.sim.pos[env_ids]).norm(dim=-1)
+            self.upright_streak[env_ids] = 0.0
+            self.prev_dist[env_ids] = (self.target[env_ids]
+                                       - self.sim.pos[env_ids]).norm(dim=-1)
         return self._obs()
+
+    def _reset_recovery(self, env_ids, m):
+        """Throw the drone: high altitude, random orientation, high spin."""
+        d = self.recovery_difficulty
+        # Hover target at a fixed altitude directly below the throw point, so
+        # the drone must both right itself AND arrest its fall/drift.
+        start = torch.zeros(m, 3, device=self.device)
+        start[:, :2] = (torch.rand(m, 2, device=self.device) * 2 - 1) * 1.5
+        start[:, 2] = 3.0 + torch.rand(m, device=self.device) * 1.5  # 3–4.5 m up
+        target = start.clone()
+        target[:, 2] = 2.0                                  # recover to 2 m hover
+        # Thrown with a tumble + kick that scale with difficulty.
+        tilt = self.recovery_max_tilt * (0.2 + 0.8 * d)
+        spin = self.recovery_max_spin * (0.2 + 0.8 * d)
+        omega0 = (torch.rand(m, 3, device=self.device) * 2 - 1) * spin
+        vel0 = torch.randn(m, 3, device=self.device) * (1.5 * (0.2 + 0.8 * d))
+        self.sim.reset(env_ids, start, vel=vel0, tilt_std=tilt, omega=omega0)
+        self.target[env_ids] = target
 
     # ------------------------------------------------------------------- step
 
@@ -128,7 +165,15 @@ class QuadrotorEnv:
         # capture doesn't register as a huge negative progress next step.
         self.prev_dist = (self.target - self.sim.pos).norm(dim=-1)
 
-        crashed = (self.sim.pos[:, 2] < 0.05) | (up_z < 0.0)
+        if self.task == "recovery":
+            # Inversion is the whole point here, so only the ground is fatal.
+            # Track how long the drone has held an upright, calm attitude.
+            stable = (up_z > 0.85) & (self.sim.omega.norm(dim=-1) < 1.5)
+            self.upright_streak = torch.where(
+                stable, self.upright_streak + 1, torch.zeros_like(self.upright_streak))
+            crashed = self.sim.pos[:, 2] < 0.05
+        else:
+            crashed = (self.sim.pos[:, 2] < 0.05) | (up_z < 0.0)
         out_of_bounds = (dist > self.arena) | (self.sim.pos[:, 2] > 2 * self.arena)
         terminated = crashed | out_of_bounds
         truncated = self.step_count >= self.max_steps
@@ -140,6 +185,7 @@ class QuadrotorEnv:
         info = {
             "dist": dist,
             "waypoints_hit": self.waypoints_hit.clone(),
+            "upright_streak": self.upright_streak.clone(),
             "done_ids": done_ids,
             "final_obs": final_obs,
         }
@@ -150,10 +196,27 @@ class QuadrotorEnv:
     # ---------------------------------------------------------------- reward
 
     def _reward(self, dist, up_z, action, progress, reached):
-        spin_pen = 0.04 * self.sim.omega.norm(dim=-1)
-        upright = 0.3 * up_z.clamp(min=0.0)
         smooth_pen = 0.10 * (action - self.prev_action).norm(dim=-1)
         alive = 0.3
+
+        if self.task == "recovery":
+            spin = self.sim.omega.norm(dim=-1)
+            speed = self.sim.vel.norm(dim=-1)
+            # Priority ladder: (1) get upright, (2) stop spinning, (3) hold the
+            # hover point. Weights reflect that order — righting dominates.
+            upright_r = 1.5 * (0.5 * up_z + 0.5)             # 0 inverted .. 1.5 level
+            spin_pen = 0.03 * spin
+            pos_r = torch.exp(-0.5 * dist)                   # 1 at target, decays
+            vel_pen = 0.03 * speed
+            # Big bonus for actually reaching the recovered state (upright+calm),
+            # so the policy is pulled toward *finishing* the recovery, not just
+            # slowing the tumble.
+            recovered = (up_z > 0.85) & (spin < 1.5)
+            return (alive + upright_r + pos_r + 2.0 * recovered.float()
+                    - spin_pen - vel_pen - smooth_pen)
+
+        upright = 0.3 * up_z.clamp(min=0.0)
+        spin_pen = 0.04 * self.sim.omega.norm(dim=-1)
         r = alive + upright - spin_pen - smooth_pen
         if self.task == "hover":
             pos_r = torch.exp(-1.2 * dist)                   # 1 at target, ~0 far

@@ -18,7 +18,7 @@ from drone_sim.viz import animate_flight, plot_trajectory
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--task", choices=["hover", "waypoint"], default="hover")
+    ap.add_argument("--task", choices=["hover", "waypoint", "recovery"], default="hover")
     ap.add_argument("--ckpt", default=None)
     ap.add_argument("--seconds", type=float, default=10.0)
     ap.add_argument("--seed", type=int, default=42)
@@ -38,9 +38,11 @@ def main():
     obs = env.reset()
     positions, targets, ups = [], [], []
     steps = int(args.seconds / env.sim.p.control_dt)
+    dt = env.sim.p.control_dt
     crashed = False
     hits = 0
-    for _ in range(steps):
+    recover_time = None            # seconds to first reach a stable upright state
+    for i in range(steps):
         positions.append(env.sim.pos[0].numpy().copy())
         targets.append(env.target[0].numpy().copy())
         ups.append(env.sim.up_vector[0].numpy().copy())
@@ -49,6 +51,9 @@ def main():
         # Read from info (captured before the env's auto-reset) so a crash
         # doesn't zero the count we report.
         hits = int(info["waypoints_hit"][0])
+        # First moment the drone holds upright+calm for ~0.3 s counts as recovered.
+        if recover_time is None and float(info["upright_streak"][0]) >= 15:
+            recover_time = (i + 1) * dt
         if terminated[0]:
             crashed = True
             break
@@ -62,6 +67,11 @@ def main():
           f"crashed={crashed}, final distance to target={final_dist:.2f} m")
     if args.task == "waypoint":
         print(f"waypoints hit: {hits}")
+    if args.task == "recovery":
+        if recover_time is not None:
+            print(f"RECOVERED in {recover_time:.2f} s (righted itself and stabilized)")
+        else:
+            print("did not stabilize within the episode")
 
     png = os.path.join(run_dir, "trajectory.png")
     gif = os.path.join(run_dir, "flight.gif")

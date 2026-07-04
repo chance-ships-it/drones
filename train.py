@@ -27,7 +27,7 @@ def pick_device(arg: str) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--task", choices=["hover", "waypoint"], default="hover")
+    ap.add_argument("--task", choices=["hover", "waypoint", "recovery"], default="hover")
     ap.add_argument("--num-envs", type=int, default=1024)
     ap.add_argument("--updates", type=int, default=300)
     ap.add_argument("--rollout-steps", type=int, default=64)
@@ -52,11 +52,17 @@ def main():
     os.makedirs(run_dir, exist_ok=True)
     ckpt = os.path.join(run_dir, "policy.pt")
 
-    def checkpoint(tr, entry):
+    def on_update(tr, entry):
+        # Recovery curriculum: ramp difficulty 0.15 -> 1.0 over the first 60% of
+        # training, so the policy first learns to right itself from mild tumbles
+        # before facing violent, fully-inverted throws.
+        if args.task == "recovery":
+            frac = entry["update"] / (0.6 * args.updates)
+            env.set_difficulty(0.15 + 0.85 * min(1.0, frac))
         if entry["update"] % 25 == 0:
             tr.save(ckpt)
 
-    trainer.train(log_every=10, on_update=checkpoint)
+    trainer.train(log_every=10, on_update=on_update)
     trainer.save(ckpt)
     plot_training(trainer.log, os.path.join(run_dir, "training_curves.png"))
     print(f"saved policy -> {ckpt}")

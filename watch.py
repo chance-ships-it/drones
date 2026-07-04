@@ -38,7 +38,7 @@ def rotor_world_positions(pos, rotmat, arm=0.16):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--task", choices=["hover", "waypoint"], default="waypoint")
+    ap.add_argument("--task", choices=["hover", "waypoint", "recovery"], default="waypoint")
     ap.add_argument("--ckpt", default=None)
     ap.add_argument("--seconds", type=float, default=0.0, help="0 = run forever")
     ap.add_argument("--speed", type=float, default=1.0, help="1.0 = real time")

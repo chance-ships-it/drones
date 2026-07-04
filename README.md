@@ -11,6 +11,10 @@ minutes.
 *A policy trained from scratch in ~2 minutes: it flies to the red target and
 holds within 2 cm, correcting against randomized mass, thrust, and drag.*
 
+![A trained quadrotor flying through a stream of waypoints](assets/waypoint_demo.gif)
+
+*The waypoint policy chases a stream of targets, hitting 30+ in 30 seconds.*
+
 ## Quick start
 
 ```bash
@@ -97,11 +101,22 @@ vectorized call.
 - **Observation (22-d):** vector to target, velocity, body→world rotation
   matrix, angular velocity, previous action
 - **Action (4-d):** normalized per-rotor thrust commands in [-1, 1]
-- **Reward:** shaped — proximity to target (exponential), upright bonus,
-  alive bonus, penalties on speed, spin, and action jerk; big penalty on
-  crash/flyaway; waypoint task adds a capture bonus
+- **Reward:** shaped. Hover uses exponential proximity + an upright/alive
+  bonus and speed/spin/jerk penalties. Waypoint uses *progress* toward the
+  target plus a capture bonus and a soft speed cap — deliberately **not**
+  proximity, which the policy learns to exploit by parking just outside the
+  capture radius and farming the reward (see the code comments in `env.py`).
 - **Algorithm:** PPO, 1024 parallel envs × 64-step rollouts (65k samples per
   update), GAE(λ=0.95), clip 0.2, correct time-limit bootstrapping
+
+## Known limitations
+
+- The **waypoint** policy reliably hits dozens of targets but still
+  destabilizes and crashes on some episodes under aggressive domain
+  randomization (~2 of 5 random seeds fly a full 30 s clean). Tightening this
+  is a reward/curriculum tuning problem — a good first thing to improve.
+- Physics is a rigid-body point model: no aerodynamic ground effect, blade
+  flapping, or battery sag. Good enough to learn control; not a wind-tunnel.
 
 ## Device notes (M-series Macs)
 

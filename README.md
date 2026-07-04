@@ -6,10 +6,18 @@ PyTorch. Simulates ~150,000 physics steps/second on an M3 CPU with 1024
 drones in parallel, enough to train a hover policy from scratch in a few
 minutes.
 
+![A thrown quadrotor righting itself and stabilizing](assets/recovery_demo.gif)
+
+*Recovery task: the drone is **thrown in fully inverted, spinning at 17 rad/s**,
+and rights itself into a stable hover in ~0.6 s. Across 512 violently-thrown
+drones at max difficulty, **100% recover (median 0.68 s)**, trained entirely on
+a MacBook. This is the aggressive, nonlinear flight regime where naive
+controllers fail.*
+
 ![A trained quadrotor approaching and holding its target](assets/hover_demo.gif)
 
-*A policy trained from scratch in ~2 minutes: it flies to the red target and
-holds within 2 cm, correcting against randomized mass, thrust, and drag.*
+*Hover task: a policy trained from scratch in ~2 minutes flies to the red target
+and holds within 2 cm, correcting against randomized mass, thrust, and drag.*
 
 ![A trained quadrotor flying through a stream of waypoints](assets/waypoint_demo.gif)
 
@@ -33,6 +41,10 @@ uv pip install --python .venv/bin/python torch numpy matplotlib
 # Harder task: fly through a sequence of random waypoints
 .venv/bin/python train.py --task waypoint --updates 600
 .venv/bin/python watch.py --task waypoint          # steer it yourself, live
+
+# Hardest task: recover from being thrown in tumbling and inverted
+.venv/bin/python train.py --task recovery --updates 500   # uses a curriculum
+.venv/bin/python evaluate.py --task recovery --seed 16     # render the recovery
 ```
 
 ## Flying it yourself — manual waypoints
@@ -72,7 +84,7 @@ paths, patrol loops, or read waypoints from a file.
 ```
 drone_sim/
   physics.py   Batched rigid-body quadrotor dynamics (pure PyTorch)
-  env.py       Vectorized RL environment: hover + waypoint tasks
+  env.py       Vectorized RL environment: hover, waypoint, recovery tasks
   ppo.py       PPO with GAE, tuned for the batched env
   viz.py       Training curves, 3D trajectory plots, flight GIFs
 train.py       Training CLI
@@ -106,8 +118,24 @@ vectorized call.
   target plus a capture bonus and a soft speed cap — deliberately **not**
   proximity, which the policy learns to exploit by parking just outside the
   capture radius and farming the reward (see the code comments in `env.py`).
+  Recovery uses a *priority ladder*: righting the attitude dominates, then
+  arresting the spin, then holding the hover point — the weights encode that
+  order, plus a bonus for reaching the stabilized state.
+- **Curriculum:** the recovery task ramps difficulty (throw violence) from
+  0.15 → 1.0 over the first 60% of training, so the policy masters mild tumbles
+  before facing fully-inverted 12-rad/s throws. `env.set_difficulty(0..1)`.
 - **Algorithm:** PPO, 1024 parallel envs × 64-step rollouts (65k samples per
   update), GAE(λ=0.95), clip 0.2, correct time-limit bootstrapping
+
+## Results
+
+| Task | Metric | Result |
+|------|--------|--------|
+| Hover | final distance to target | **~2 cm** |
+| Waypoint | checkpoints hit in 30 s | **30+** (see limitations) |
+| Recovery | recover from a max-difficulty throw | **100%** of 512 drones, **median 0.68 s** |
+
+All trained from scratch on a MacBook M3 CPU in 2–5 minutes each.
 
 ## Known limitations
 
@@ -115,8 +143,13 @@ vectorized call.
   destabilizes and crashes on some episodes under aggressive domain
   randomization (~2 of 5 random seeds fly a full 30 s clean). Tightening this
   is a reward/curriculum tuning problem — a good first thing to improve.
+- The **recovery** policy touches the ground on ~2% of throws — these are cases
+  thrown *downward* near the floor with too little altitude to physically
+  right in time, not control failures.
 - Physics is a rigid-body point model: no aerodynamic ground effect, blade
   flapping, or battery sag. Good enough to learn control; not a wind-tunnel.
+- No sensor noise or actuation latency **yet** — so policies are not sim-to-real
+  ready. That's the next milestone (see `ROADMAP.md`).
 
 ## Device notes (M-series Macs)
 
